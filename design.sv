@@ -1,9 +1,7 @@
 // master_slave_fixed.sv
 `timescale 1ns/1ps
 
-// ------------------------------------------------------------------
-// MASTER: master_ahb
-// ------------------------------------------------------------------
+// --------------------- corrected master_ahb (key fixes) --------------------
 module master_ahb(
   input  logic        clk_master,
   input  logic        rst_master,
@@ -31,7 +29,6 @@ module master_ahb(
   output logic fifo_full
 );
 
-  // state encoding
   typedef enum logic [2:0] {
     S_IDLE                = 3'b000,
     S_WRITE_ADDR          = 3'b001,
@@ -50,42 +47,46 @@ module master_ahb(
 
   // Outputs are registered as well (driven from next_* in seq block)
   logic next_HWRITE;
-  logic next_HSIZE;
+  logic [2:0] next_HSIZE;               // <--- FIXED: 3-bit
   logic [31:0] next_HWDATA;
   logic [2:0] next_HBURST;
   logic [1:0] next_HTRANS;
 
-  // Derived outputs
-  assign fifo_empty = (wr_ptr == rd_ptr);
-  assign fifo_full  = ((wr_ptr + 1) == rd_ptr);
+  // FIFO count to avoid pointer race/X issues
+  logic [4:0] fifo_count; // can hold 0..MEM_DEPTH
+
+  // Derived outputs (use fifo_count)
+  assign fifo_empty = (fifo_count == 0);
+  assign fifo_full  = (fifo_count >= MEM_DEPTH-1); // leave one slot if circular pointer scheme
 
   // ----------------------------------------------------------------
-  // SINGLE always_ff: FIFO push, pointers, state registers, outputs
-  // This block is the single owner for wr_ptr, rd_ptr, addr_internal,
-  // count, present_state and AHB output registers.
+  // Sequential block: FIFO push/pop, pointers, state registers, outputs
   // ----------------------------------------------------------------
-  always_ff @(posedge clk_master) begin
+  always_ff @(posedge clk_master or posedge rst_master) begin
     if (rst_master) begin
       // reset pointers/state/outputs
-      wr_ptr       <= 4'd0;
-      rd_ptr       <= 4'd0;
-      addr_internal<= 32'h0;
-      count        <= 4'd0;
-      present_state<= S_IDLE;
+      wr_ptr        <= 4'd0;
+      rd_ptr        <= 4'd0;
+      addr_internal <= 32'h0;
+      count         <= 4'd0;
+      present_state <= S_IDLE;
 
-      HWRITE       <= 1'b0;
-      HSIZE        <= 3'b010;
-      HWDATA       <= 32'h0;
-      HBURST       <= 3'b000;
-      HTRANS       <= 2'b00;
+      HWRITE        <= 1'b0;
+      HSIZE         <= 3'b010;
+      HWDATA        <= 32'h0;
+      HBURST        <= 3'b000;
+      HTRANS        <= 2'b00;
+
+      fifo_count    <= 5'd0;
 
       // clear FIFO memory
       for (int i = 0; i < MEM_DEPTH; i = i + 1) mem[i] <= 32'h0;
     end else begin
-      // ---- FIFO push (from testbench/input) ----
-      if (write_top) begin
+      // ---- FIFO push (synchronous capture) ----
+      if (write_top && (fifo_count < MEM_DEPTH)) begin
         mem[wr_ptr] <= data_top;
         wr_ptr <= wr_ptr + 1'b1;
+        fifo_count <= fifo_count + 1'b1;
       end
 
       // ---- state update ----
@@ -99,7 +100,6 @@ module master_ahb(
       HTRANS <= next_HTRANS;
 
       // ---- address/load/start behavior ----
-      // Load base address at the beginning of an address phase
       if (present_state == S_IDLE && next_state == S_WRITE_ADDR) begin
         addr_internal <= addr_top;
         count <= 4'd0;
@@ -107,24 +107,25 @@ module master_ahb(
 
       // ---- data-phase progression when slave indicates ready ----
       if (present_state == S_WRITE_DATA && HREADY) begin
+        // If we are issuing a burst, consume one element from FIFO (if available)
         if (HBURST == 3'b011) begin // INCR4/WRAP4
-          // increment beat counter and read pointer
+          if (fifo_count > 0) begin
+            rd_ptr <= rd_ptr + 1'b1;
+            fifo_count <= fifo_count - 1'b1;
+          end
+          // increment beat counter and update address (wrap/increment)
           count <= count + 1'b1;
-          rd_ptr <= rd_ptr + 1'b1;
-
-          // address increment or wrap (4-byte transfers)
           if (!wrap_enb) begin
             addr_internal <= addr_internal + 32'h4;
           end else begin
-            // wrap at 16-byte boundary: compute low nibble
             logic [3:0] low_nibble = addr_internal[3:0];
             if (low_nibble == 4'hC) // last beat before wrap (word offset 3)
               addr_internal <= addr_internal - 32'hC; // go to base
             else
               addr_internal <= addr_internal + 32'h4;
           end
-        end
-        else if (HBURST == 3'b000) begin // SINGLE
+        end else if (HBURST == 3'b000) begin // SINGLE
+          // nothing to pop for single (we will directly use mem/ or capture data_top earlier)
           count <= 4'd0; // single completes
         end
       end
@@ -133,31 +134,27 @@ module master_ahb(
 
   // ----------------------------------------------------------------
   // Combinational next-state + next-output logic
-  // Only produces next_* signals consumed by sequential block above.
   // ----------------------------------------------------------------
   always_comb begin
     // defaults
     next_state    = present_state;
     next_HWRITE   = 1'b0;
     next_HSIZE    = 3'b010;
-    next_HWDATA   = 32'hx;
+    next_HWDATA   = 32'h0;                // <-- avoid X default
     next_HBURST   = 3'b000;
     next_HTRANS   = 2'b00;
 
     case (present_state)
       S_IDLE: begin
-        // start transaction only when enb and HREADY and write requested
-        if (enb && HREADY && (wr_ptr != rd_ptr)) begin
-          // If testbench wants single write and provided beat_length=1
+        // start transaction only when enb and HREADY and there is data in FIFO
+        if (enb && HREADY && (fifo_count > 0)) begin
           if (beat_length == 1 && !wrap_enb) begin
             next_HWRITE = 1'b1;
             next_HBURST = 3'b000; // SINGLE
             next_state = S_WRITE_ADDR;
-          end
-          // INCR4 or WRAP4
-          else if (beat_length == 4) begin
+          end else if (beat_length == 4) begin
             next_HWRITE = 1'b1;
-            next_HBURST = 3'b011; // INCR4 (we treat WRAP via wrap_enb in seq)
+            next_HBURST = 3'b011; // INCR4
             next_state = S_WRITE_ADDR;
           end
         end
@@ -177,15 +174,22 @@ module master_ahb(
 
         // SINGLE
         if (HBURST == 3'b000) begin
-          next_HWDATA = data_top;  // direct data from testbench for single
+          // For safety, use the FIFO entry if available; else use data_top
+          if (fifo_count > 0)
+            next_HWDATA = mem[rd_ptr];  // pop will occur in sequential block when HREADY
+          else
+            next_HWDATA = data_top;
           next_HTRANS = 2'b10;
           if (HREADY) next_state = S_IDLE;
         end
-        // INCR4/WRAP4 (drive from FIFO memory)
+        // INCR4/WRAP4 (drive from FIFO memory only if data present)
         else if (HBURST == 3'b011) begin
-          next_HWDATA = mem[rd_ptr];
+          if (fifo_count > 0) begin
+            next_HWDATA = mem[rd_ptr];
+          end else begin
+            next_HWDATA = 32'h0; // safe fallback, prevents X
+          end
           next_HTRANS = 2'b11; // SEQUENTIAL
-          // if we completed 4 beats (counter 0..3), next_state -> idle at completion
           if ((count == 4'd3) && HREADY) next_state = S_IDLE;
         end
       end
@@ -197,12 +201,9 @@ module master_ahb(
   // HADDR is driven directly by registered addr_internal
   assign HADDR = addr_internal;
 
-endmodule // master_ahb
+endmodule
+// --------------------- end corrected master_ahb --------------------------
 
-
-// ------------------------------------------------------------------
-// SLAVE: slave_ahbyt
-// ------------------------------------------------------------------
 module slave_ahbyt(
   input  logic        HCLK,
   input  logic        HRESET,
@@ -225,78 +226,60 @@ module slave_ahbyt(
 
   sl_state_t ps, ns;
 
-  // sample registers (only written in seq block)
-  logic [1:0] sampled_HTRANS;
-  logic       sampled_HWRITE;
+  logic [1:0]  sampled_HTRANS;
+  logic        sampled_HWRITE;
   logic [31:0] sampled_HADDR;
+  logic [31:0] sampled_HWDATA;
 
-  // next-output signals (combinational)
-  logic next_HREADY;
-  logic next_HRESP;
+  logic next_HREADY, next_HRESP;
 
-  // ----------------------------------------------------------------
-  // always_ff: sample inputs, update PS and outputs (single owner)
-  // ----------------------------------------------------------------
-  always_ff @(posedge HCLK) begin
+  always_ff @(posedge HCLK or posedge HRESET) begin
     if (HRESET) begin
       ps <= SL_IDLE;
       sampled_HTRANS <= 2'b00;
       sampled_HWRITE <= 1'b0;
       sampled_HADDR  <= 32'h0;
+      sampled_HWDATA <= 32'h0;
       HREADY <= 1'b1;
       HRESP  <= 1'b0;
       HRDATA <= 32'h0;
     end else begin
-      // state register
       ps <= ns;
 
-      // sample inputs (registered)
       sampled_HTRANS <= HTRANS;
       sampled_HWRITE <= HWRITE;
       sampled_HADDR  <= HADDR;
+      sampled_HWDATA <= HWDATA;
 
-      // update outputs from combinational next_* values
       HREADY <= next_HREADY;
       HRESP  <= next_HRESP;
 
-      // if going to write state, capture the HWDATA into HRDATA to present back
-      if (ns == SL_WRITE) begin
-        HRDATA <= HWDATA;
-      end
+      if (ns == SL_WRITE)
+        HRDATA <= sampled_HWDATA;
     end
   end
 
-  // ----------------------------------------------------------------
-  // Combinational next-state logic
-  // ----------------------------------------------------------------
   always_comb begin
     ns = ps;
-    next_HREADY = 1'b1;
-    next_HRESP  = 1'b0;
+    next_HREADY = 1;
+    next_HRESP  = 0;
 
     case (ps)
       SL_IDLE: begin
-        next_HREADY = 1'b1;
         ns = SL_SAMPLE;
       end
 
       SL_SAMPLE: begin
-        // If a valid transfer (NONSEQ or SEQ) and HWRITE asserted -> accept and go to write
-        if ((HTRANS == 2'b10 || HTRANS == 2'b11) && HWRITE) begin
+        // Valid AHB address phase
+        if ((HTRANS == 2'b10 || HTRANS == 2'b11) &&
+            (HWRITE == 1'b1)) begin
           ns = SL_WRITE;
-        end else begin
-          ns = SL_SAMPLE;
         end
       end
 
       SL_WRITE: begin
-        // Present data and be ready; after write, go back to sample
-        next_HREADY = 1'b1;
         ns = SL_SAMPLE;
       end
-
-      default: ns = SL_IDLE;
     endcase
   end
-
-endmodule // slave_ahbyt
+endmodule
