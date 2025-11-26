@@ -4,6 +4,7 @@
 module top_tb;
 
     logic clk, rst;
+    transaction tr;
 
     // ---------------------------------------------------
     // Clock Generation
@@ -18,15 +19,15 @@ module top_tb;
     // ---------------------------------------------------
     initial begin
         rst = 1;
-        #20 rst = 0;
+        #30 rst = 0;
     end
 
     // ---------------------------------------------------
-    // Waveform Dump
+    // Dump
     // ---------------------------------------------------
     initial begin
-        $dumpfile("ahb_wave.vcd");   // waveform file
-        $dumpvars(0, top_tb);        // dump everything in tb scope
+        $dumpfile("ahb_wave.vcd");
+        $dumpvars(0, top_tb);
     end
 
     // ---------------------------------------------------
@@ -34,13 +35,13 @@ module top_tb;
     // ---------------------------------------------------
     ahb_if ahb(clk, rst);
 
-    // DUT I/O signals
+    // TB signals
     logic [31:0] data_top, addr_top;
     logic write_top, enb, wrap_enb;
     logic [3:0] beat_length;
 
     // ---------------------------------------------------
-    // Instantiate DUT : AHB Master
+    // MASTER
     // ---------------------------------------------------
     master_ahb master_u(
         .clk_master(clk),
@@ -60,14 +61,11 @@ module top_tb;
         .HSIZE(ahb.HSIZE),
         .HWDATA(ahb.HWDATA),
         .HBURST(ahb.HBURST),
-        .HTRANS(ahb.HTRANS),
-
-        .fifo_empty(),
-        .fifo_full()
+        .HTRANS(ahb.HTRANS)
     );
 
     // ---------------------------------------------------
-    // Instantiate DUT : AHB Slave
+    // SLAVE
     // ---------------------------------------------------
     slave_ahbyt slave_u(
         .HCLK(clk),
@@ -83,69 +81,161 @@ module top_tb;
         .HRDATA(ahb.HRDATA)
     );
 
-    // ---------------------------------------------------
-    // Environment + TEST SCENARIOS
-    // ---------------------------------------------------
     environment env;
 
+    // ---------------------------------------------------
+    // TEST SEQUENCES FOR 100% COVERAGE
+    // ---------------------------------------------------
     initial begin
         env = new(ahb);
-        env.run();  // your original environment first
+        tr  = new();
 
-        // ---------------------------------------------------
-        // MANUAL TEST SEQUENCES FOR WAVEFORMS
-        // ---------------------------------------------------
-        #50;
-        $display("\n========== TESTCASE 1: SINGLE WRITE ==========");
+        data_top    = 32'h0;
+        addr_top    = 32'h0;
+        write_top   = 0;
+        enb         = 0;
+        wrap_enb    = 0;
+        beat_length = 0;
 
-        addr_top     = 32'h0000_0100;
-        data_top     = 32'hAABB_CCDD;
-        write_top    = 1;  #10; write_top = 0;
-        beat_length  = 1;
-        wrap_enb     = 0;
-        enb          = 1;  #10; enb = 0;
+        @(negedge rst); #20;
 
-        #200;
+        // ==========================================================
+        // TESTCASE-1 : SINGLE (class=3)
+        // ==========================================================
+        @(posedge clk);
+        addr_top    = 32'h0000_0100;
+        beat_length = 1;
+        wrap_enb    = 0;
 
-        // ---------------------------------------------------
-        $display("\n========== TESTCASE 2: INCR4 BURST WRITE ==========");
+        @(posedge clk);
+        write_top = 1; data_top = 32'hAABB_CCDD; // class=3
 
-        addr_top = 32'h0000_0200;
+        @(posedge clk);
+        write_top = 0;
 
-        data_top = 32'h1111_0001; write_top = 1; #10;
-        data_top = 32'h2222_0002; #10;
-        data_top = 32'h3333_0003; #10;
-        data_top = 32'h4444_0004; #10; write_top = 0;
+        @(posedge clk); enb = 1;
+        @(posedge clk); enb = 0;
 
+        @(posedge clk);
+        tr.addr        = addr_top;
+        tr.data[0]     = 32'hAABB_CCDD;
+        tr.beat_length = 1;
+        tr.wrap_en     = 0;
+        tr.sample_cov();
+
+
+        // ==========================================================
+        // TESTCASE-2 : INCR4 (class=0)
+        // ==========================================================
+        @(posedge clk);
+        addr_top    = 32'h0000_0200;
         beat_length = 4;
-        wrap_enb = 0;
-        enb = 1; #10; enb = 0;
+        wrap_enb    = 0;
 
-        #300;
+        @(posedge clk); write_top = 1; data_top = 32'h1111_0001; // class=0
+        @(posedge clk);              data_top = 32'h2222_0002;
+        @(posedge clk);              data_top = 32'h3333_0003;
+        @(posedge clk);              data_top = 32'h4444_0004;
+        @(posedge clk); write_top = 0;
 
-        // ---------------------------------------------------
-        $display("\n========== TESTCASE 3: WRAP4 BURST WRITE ==========");
+        @(posedge clk); enb = 1;
+        @(posedge clk); enb = 0;
 
-        addr_top = 32'h0000_00FC;
+        @(posedge clk);
+        tr.addr        = 32'h0000_0200;
+        tr.data[0]     = 32'h1111_0001;
+        tr.beat_length = 4;
+        tr.wrap_en     = 0;
+        tr.sample_cov();
 
-        data_top = 32'hAAAA_0001; write_top = 1; #10;
-        data_top = 32'hBBBB_0002; #10;
-        data_top = 32'hCCCC_0003; #10;
-        data_top = 32'hDDDD_0004; #10; write_top = 0;
 
+        // ==========================================================
+        // TESTCASE-3 : WRAP4 (class=0)
+        // ==========================================================
+        @(posedge clk);
+        addr_top    = 32'h0000_00FC;
         beat_length = 4;
-        wrap_enb = 1;
-        enb = 1; #10; enb = 0;
+        wrap_enb    = 1;
 
-        #300;
+        @(posedge clk); write_top = 1; data_top = 32'hAAAA_0001; // class=0
+        @(posedge clk);              data_top = 32'hBBBB_0002;
+        @(posedge clk);              data_top = 32'hCCCC_0003;
+        @(posedge clk);              data_top = 32'hDDDD_0004;
+        @(posedge clk); write_top = 0;
 
-        // ---------------------------------------------------
-        // PRINT COVERAGE (your original code)
-        // ---------------------------------------------------
-        env.print_cov();
+        @(posedge clk); enb = 1;
+        @(posedge clk); enb = 0;
 
-        $display("\n========== ALL TESTCASES COMPLETED ==========");
+        @(posedge clk);
+        tr.addr        = 32'h0000_00FC;
+        tr.data[0]     = 32'hAAAA_0001;
+        tr.beat_length = 4;
+        tr.wrap_en     = 1;
+        tr.sample_cov();
+
+
+        // ==========================================================
+        // TESTCASE-4 : SINGLE + WRAP=1  (class=1)
+        // ==========================================================
+        @(posedge clk);
+        addr_top    = 32'h0000_0300;  // New addr_lsb
+        beat_length = 1;
+        wrap_enb    = 1;
+
+        @(posedge clk); write_top = 1; data_top = 32'h1234_40FF; // class=1
+        @(posedge clk); write_top = 0;
+
+        @(posedge clk); enb = 1;
+        @(posedge clk); enb = 0;
+
+        @(posedge clk);
+        tr.addr        = addr_top;
+        tr.data[0]     = 32'h1234_40FF;
+        tr.beat_length = 1;
+        tr.wrap_en     = 1;
+        tr.sample_cov();
+
+
+        // ==========================================================
+        // TESTCASE-5 : SINGLE + WRAP=0  (class=2)
+        // ==========================================================
+        @(posedge clk);
+        addr_top    = 32'h0000_0400;  // Another addr_lsb value
+        beat_length = 1;
+        wrap_enb    = 0;
+
+        @(posedge clk); write_top = 1; data_top = 32'h5678_80AA; // class=2
+        @(posedge clk); write_top = 0;
+
+        @(posedge clk); enb = 1;
+        @(posedge clk); enb = 0;
+
+        @(posedge clk);
+        tr.addr        = addr_top;
+        tr.data[0]     = 32'h5678_80AA;
+        tr.beat_length = 1;
+        tr.wrap_en     = 0;
+        tr.sample_cov();
+
+
+        // ==========================================================
+        // COVERAGE REPORT
+        // ==========================================================
+        #20;
+        $display("\n================ COVERAGE REPORT =================");
+        $display("Total Functional Coverage = %0.2f %%", $get_coverage());
+        $display("===================================================\n");
+
+        $display("========== ALL TESTCASES COMPLETED ==========");
         $finish;
     end
 
 endmodule
+
+
+
+
+
+
+
+
